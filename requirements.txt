@@ -1,0 +1,7 @@
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+tensorboard==2.20.0
+matplotlib==3.10.3
+tqdm==4.67.1
+imageio==2.37.0
