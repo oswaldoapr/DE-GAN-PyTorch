@@ -14,12 +14,26 @@ import imageio
 from models.models import Generator, Discriminator, GAN, get_optimizer
 from utils import getPatches, split2, merge_image2, psnr
 
+from torch.utils.data import Dataset, DataLoader
+
+
+class PatchDataset(Dataset):
+    def __init__(self, deg_patches, clean_patches):
+        self.deg_patches = deg_patches
+        self.clean_patches = clean_patches
+
+    def __len__(self):
+        return len(self.deg_patches)
+
+    def __getitem__(self, idx):
+        return self.deg_patches[idx], self.clean_patches[idx]
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 input_size = (256, 256, 1)
-SCANNED_PATH = "data/train/scanned/"
-GROUND_TRUTH_PATH = "data/train/ground_truth/"
+SCANNED_PATH = "/Users/oswaldo/PycharmProjects/thesis/data/result/scanned_images/"
+GROUND_TRUTH_PATH = "/Users/oswaldo/PycharmProjects/thesis/data/result/ground_truth_images/"
 VALIDATION_CLEAN_PATH = 'CLEAN/VALIDATION/GT/'
 VALIDATION_DATA_PATH = 'CLEAN/VALIDATION/DATA/'
 
@@ -36,13 +50,44 @@ def train_gan(generator, discriminator, ep_start=1, epochs=1, batch_size=1):
     optimizer_G = get_optimizer(generator)
     optimizer_D = get_optimizer(discriminator)
 
-    list_deg_images = [f for f in os.listdir(SCANNED_PATH) if
-                       f.endswith(".png")]
-    list_clean_images = [f for f in os.listdir(GROUND_TRUTH_PATH) if
-                         f.endswith(".png")]
+    list_deg_images = [f
+                       for f in os.listdir(SCANNED_PATH)
+                       if f.endswith(".png")]
+    list_clean_images = [f
+                         for f in os.listdir(GROUND_TRUTH_PATH)
+                         if f.endswith(".png")]
 
     list_deg_images.sort()
     list_clean_images.sort()
+
+    # Preload all patches
+    all_wat_patches = []
+    all_gt_patches = []
+
+    for im_idx in tqdm(range(len(list_deg_images))):
+        deg_image_path = os.path.join(SCANNED_PATH,
+                                      list_deg_images[im_idx])
+        clean_image_path = os.path.join(GROUND_TRUTH_PATH,
+                                        list_clean_images[im_idx])
+
+        deg_image_pil = Image.open(deg_image_path).convert('L')
+        clean_image_pil = Image.open(clean_image_path).convert('L')
+
+        deg_image_np = np.array(deg_image_pil).astype(np.float32) / 255.0
+        clean_image_np = np.array(clean_image_pil).astype(np.float32) / 255.0
+
+        wat_batch_np, gt_batch_np = getPatches(deg_image_np,
+                                               clean_image_np,
+                                               mystride=128 + 64)
+
+        all_wat_patches.append(wat_batch_np)
+        all_gt_patches.append(gt_batch_np)
+
+    all_wat_patches_tensor = torch.cat(all_wat_patches, dim=0).to(device)
+    all_gt_patches_tensor = torch.cat(all_gt_patches, dim=0).to(device)
+
+    dataset = PatchDataset(all_wat_patches_tensor, all_gt_patches_tensor)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     log_dir = "logs/gan_training_pytorch"
     discriminator_log_dir = os.path.join(log_dir, "discriminator")
@@ -61,102 +106,95 @@ def train_gan(generator, discriminator, ep_start=1, epochs=1, batch_size=1):
 
         g_loss_epoch = 0
 
-        for im_idx in tqdm(range(len(list_deg_images))):
-            deg_image_path = os.path.join(SCANNED_PATH,
-                                          list_deg_images[im_idx])
-            clean_image_path = os.path.join(GROUND_TRUTH_PATH,
-                                            list_clean_images[im_idx])
+        for b, (b_wat_batch, b_gt_batch) in enumerate(
+                tqdm(dataloader)
+        ):
+            b_wat_batch = b_wat_batch.to(device)
+            b_gt_batch = b_gt_batch.to(device)
 
-            deg_image_pil = Image.open(deg_image_path).convert('L')
-            clean_image_pil = Image.open(clean_image_path).convert('L')
+            optimizer_D.zero_grad()
 
-            deg_image_np = np.array(deg_image_pil).astype(np.float32) / 255.0
-            clean_image_np = np.array(clean_image_pil).astype(
-                np.float32) / 255.0
+            generated_images = generator(b_wat_batch).detach()
 
-            wat_batch_np, gt_batch_np = getPatches(deg_image_np,
-                                                   clean_image_np,
-                                                   mystride=128 + 64)
+            real_output_d = discriminator(b_gt_batch, b_wat_batch)
 
-            num_patches = wat_batch_np.shape[0]
-            batch_count = num_patches // batch_size
+            real_labels = torch.ones_like(real_output_d, device=device)
+            d_loss_real = criterion_discriminator(real_output_d,
+                                                  real_labels)
 
-            for b in range(batch_count):
-                start_idx = b * batch_size
-                end_idx = start_idx + batch_size
+            fake_output_d = discriminator(generated_images, b_wat_batch)
+            fake_labels = torch.zeros_like(fake_output_d, device=device)
+            d_loss_fake = criterion_discriminator(fake_output_d,
+                                                  fake_labels)
 
-                b_wat_batch = wat_batch_np[start_idx:end_idx].to(device)
-                b_gt_batch = gt_batch_np[start_idx:end_idx].to(device)
+            d_loss = 0.5 * (d_loss_real + d_loss_fake)
+            d_loss.backward()
+            optimizer_D.step()
 
-                optimizer_D.zero_grad()
+            d_acc_real = ((real_output_d >= 0.5).float().mean() * 100).item()
+            d_acc_fake = ((fake_output_d < 0.5).float().mean() * 100).item()
+            d_acc = 0.5 * (d_acc_real + d_acc_fake)
 
-                generated_images = generator(b_wat_batch).detach()
+            writer_d.add_scalar('Loss/d_loss_total',
+                                d_loss.item(),
+                                global_step)
+            writer_d.add_scalar('Loss/d_loss_real',
+                                d_loss_real.item(),
+                                global_step)
+            writer_d.add_scalar('Loss/d_loss_fake',
+                                d_loss_fake.item(),
+                                global_step)
+            writer_d.add_scalar('Accuracy/d_accuracy',
+                                d_acc,
+                                global_step)
 
-                real_output_d = discriminator(b_gt_batch, b_wat_batch)
+            optimizer_G.zero_grad()
 
-                real_labels = torch.ones_like(real_output_d, device=device)
-                d_loss_real = criterion_discriminator(real_output_d,
-                                                      real_labels)
+            generated_images = generator(b_wat_batch)
+            gen_output_d = discriminator(generated_images, b_wat_batch)
+            gen_labels = torch.ones_like(gen_output_d, device=device)
 
-                fake_output_d = discriminator(generated_images, b_wat_batch)
-                fake_labels = torch.zeros_like(fake_output_d, device=device)
-                d_loss_fake = criterion_discriminator(fake_output_d,
-                                                      fake_labels)
+            g_loss_gan = criterion_generator_gan(gen_output_d, gen_labels)
 
-                d_loss = 0.5 * (d_loss_real + d_loss_fake)
-                d_loss.backward()
-                optimizer_D.step()
+            g_loss_pixel = criterion_generator_pixel(generated_images,
+                                                     b_gt_batch)
 
-                d_acc_real = (
-                            (real_output_d >= 0.5).float().mean() * 100).item()
-                d_acc_fake = (
-                            (fake_output_d < 0.5).float().mean() * 100).item()
-                d_acc = 0.5 * (d_acc_real + d_acc_fake)
+            g_loss = g_loss_gan + 100 * g_loss_pixel
+            g_loss.backward()
+            optimizer_G.step()
 
-                writer_d.add_scalar('Loss/d_loss_total', d_loss.item(),
-                                    global_step)
-                writer_d.add_scalar('Loss/d_loss_real', d_loss_real.item(),
-                                    global_step)
-                writer_d.add_scalar('Loss/d_loss_fake', d_loss_fake.item(),
-                                    global_step)
-                writer_d.add_scalar('Accuracy/d_accuracy', d_acc, global_step)
+            writer_g.add_scalar('Loss/g_total_loss',
+                                g_loss.item(),
+                                global_step)
+            writer_g.add_scalar('Loss/g_gan_loss',
+                                g_loss_gan.item(),
+                                global_step)
+            writer_g.add_scalar('Loss/g_pixel_loss',
+                                g_loss_pixel.item(),
+                                global_step)
 
-                optimizer_G.zero_grad()
+            g_acc_disc_output = (
+                    (gen_output_d >= 0.5).float().mean() * 100
+            ).item()
+            writer_g.add_scalar('Accuracy/g_disc_output_accuracy',
+                                g_acc_disc_output,
+                                global_step)
 
-                generated_images = generator(b_wat_batch)
-                gen_output_d = discriminator(generated_images, b_wat_batch)
-                gen_labels = torch.ones_like(gen_output_d, device=device)
+            global_step += 1
 
-                g_loss_gan = criterion_generator_gan(gen_output_d, gen_labels)
+            if b % 10 == 0:
+                print(
+                    f"Batch {b}/{len(dataloader)} | "
+                    f"D Loss: {d_loss.item():.4f} (Acc: {d_acc:.2f}%) | "
+                    f"G Loss: {g_loss.item():.4f} "
+                    f"(GAN Loss: {g_loss_gan.item():.4f}, "
+                    f"Pixel Loss: {g_loss_pixel.item():.4f}, "
+                    f"Disc Acc: {g_acc_disc_output:.2f}%)"
+                )
 
-                g_loss_pixel = criterion_generator_pixel(generated_images,
-                                                         b_gt_batch)
+            g_loss_epoch += g_loss.item()
 
-                g_loss = g_loss_gan + 100 * g_loss_pixel
-                g_loss.backward()
-                optimizer_G.step()
-
-                writer_g.add_scalar('Loss/g_total_loss', g_loss.item(),
-                                    global_step)
-                writer_g.add_scalar('Loss/g_gan_loss', g_loss_gan.item(),
-                                    global_step)
-                writer_g.add_scalar('Loss/g_pixel_loss', g_loss_pixel.item(),
-                                    global_step)
-
-                g_acc_disc_output = (
-                            (gen_output_d >= 0.5).float().mean() * 100).item()
-                writer_g.add_scalar('Accuracy/g_disc_output_accuracy',
-                                    g_acc_disc_output, global_step)
-
-                global_step += 1
-
-                if b % 10 == 0:
-                    print(
-                        f"  Batch {b}/{batch_count} | D Loss: {d_loss.item():.4f} (Acc: {d_acc:.2f}%) | G Loss: {g_loss.item():.4f} (GAN Loss: {g_loss_gan.item():.4f}, Pixel Loss: {g_loss_pixel.item():.4f}, Disc Acc: {g_acc_disc_output:.2f}%)")
-
-            g_loss_epoch += g_loss.item() / batch_count
-
-        g_loss_epoch /= len(list_deg_images)
+        g_loss_epoch /= len(dataloader)
 
         print(f"Epoch {epoch} finished. Average G Loss: {g_loss_epoch:.4f}")
 
@@ -169,12 +207,17 @@ def train_gan(generator, discriminator, ep_start=1, epochs=1, batch_size=1):
             torch.save(generator.state_dict(),
                        os.path.join(epoch_weights_path, 'generator.pth'))
             print(
-                f"Saved models for epoch {epoch} as G loss improved from {last_g_loss_epoch:.4f} to {g_loss_epoch:.4f}")
+                f"Saved models for epoch {epoch} as G loss improved from "
+                f"{last_g_loss_epoch:.4f} to {g_loss_epoch:.4f}"
+            )
             last_g_loss_epoch = g_loss_epoch
 
         # if (epoch == 1 or epoch % 2 == 0):
         #     print("Running evaluation...")
         #     evaluate(generator, epoch)
+
+    writer_d.close()
+    writer_g.close()
 
 
 def predic(generator, epoch):
