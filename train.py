@@ -32,8 +32,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 input_size = (256, 256, 1)
-SCANNED_PATH = "/Users/oswaldo/PycharmProjects/thesis/data/result/scanned_images/"
-GROUND_TRUTH_PATH = "/Users/oswaldo/PycharmProjects/thesis/data/result/ground_truth_images/"
+SCANNED_PATH = "data/train/scanned/"
+GROUND_TRUTH_PATH = "data/train/ground_truth/"
 VALIDATION_CLEAN_PATH = 'CLEAN/VALIDATION/GT/'
 VALIDATION_DATA_PATH = 'CLEAN/VALIDATION/DATA/'
 
